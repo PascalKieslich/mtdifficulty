@@ -1,0 +1,458 @@
+---
+title: "Predicting respondent difficulty in web surveys: A machine-learning approach based on mouse movement features"
+output: html_document
+---
+
+#### Authors: Amanda Fernández-Fontelo, Pascal J. Kieslich, Felix Henninger, Frauke Kreuter, Sonja Greven
+
+
+```{r libraries,echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+library(MASS)
+library(ggplot2)
+library(tree)
+library(randomForest)
+library(parallelMap)
+library(kernlab)
+library(mlr)
+library(parallel)
+library(checkmate)
+```
+
+```{r read_data,echo=FALSE,eval=FALSE}
+data=read.csv("...",sep="...",header=TRUE)
+```
+
+```{r parameters,echo=TRUE,eval=FALSE}
+# List of parameters to be filled out before running the mlr codes 
+threshold_hovers=250
+threshold_flips=0
+# possible positive classes: complex (employment detail) and unsorted (employee and education level)
+positive_class="complex"
+checkmate::assertChoice(positive_class,choices=c("complex","unsorted"))
+# possible values for personalization: N (no personalization), B (baseline) and BP (baseline and position)
+personalization="N"
+checkmate::assertChoice(personalization,choices=c("N","B","BP"))
+```
+
+```{r data format,echo=TRUE,eval=FALSE}
+# Data subsetting and preprocessing depending on the type of personalization 
+if(personalization=="N"){
+  data.aux=data[ ,c("condition",
+                  "demography_age",
+                  "demography_sex_f",
+                   paste("xpos_flips_",threshold_flips,sep=""),
+                   paste("ypos_flips_",threshold_flips,sep=""),
+                  "total_dist",
+                   paste("hovers_",threshold_hovers,sep=""),
+                   paste("hover_time_",threshold_hovers,sep=""),
+                  "RT",
+                  "vel_max",
+                  "acc_max",  
+                  "initiation_time")]
+  } else if(personalization=="B") {
+  data.aux=data[ ,c("condition",
+                  "demography_age",
+                  "demography_sex_f",
+                   paste(paste("xpos_flips_",threshold_flips,sep=""),"_resid",sep=""),
+                   paste(paste("ypos_flips_",threshold_flips,sep=""),"_resid",sep=""),
+                  "total_dist_resid",
+                   paste(paste("hovers_",threshold_hovers,sep=""),"_resid",sep=""),
+                   paste(paste("hover_time_",threshold_hovers,sep=""),"_resid",sep=""),
+                  "RT_resid",
+                  "vel_max_resid",
+                  "acc_max_resid",  
+                  "initiation_time_resid")]
+  } else {
+  data.aux=data[ ,c("condition",
+                  "demography_age",
+                  "demography_sex_f",
+                   paste(paste("xpos_flips_",threshold_flips,sep=""),"_corrected",sep=""),
+                   paste(paste("ypos_flips_",threshold_flips,sep=""),"_corrected",sep=""),
+                  "total_dist_corrected",
+                   paste(paste("hovers_",threshold_hovers,sep=""),"_corrected",sep=""),
+                   paste(paste("hover_time_",threshold_hovers,sep=""),"_corrected",sep=""),
+                  "RT_corrected",
+                  "vel_max_corrected",
+                  "acc_max_corrected",  
+                  "initiation_time_corrected")]}
+# The "ref" category corresponds to the "positive category" set in the mlr classifiers
+data.aux[,"condition"]=relevel(data.aux[,"condition"],ref=positive_class)
+data.aux=data.aux[data.aux[,"demography_sex_f"]!="other",]
+data.aux[,"demography_sex_f"]=as.factor(as.numeric(data.aux[,"demography_sex_f"]))
+levels(data.aux[,"demography_sex_f"])=c("female","male")
+for(j in 1:9) data.aux[,j+3]=as.numeric(as.character(data.aux[,j+3]))
+```
+
+## Data description
+```{r summary,echo=TRUE,eval=FALSE}
+data.aux=na.omit(data.aux)
+summary(data.aux)
+```
+
+```{r remove_NA_data,echo=TRUE,eval=FALSE}
+#  Defining the number of cores for parallelization 
+core=32
+```
+
+## Predictive models with mlr package
+
+```{r mlr_task,echo=TRUE,eval=FALSE}
+# Defining a classification Task
+  # data should be the data set with the predictors and the target variable 
+  # target should be the name of the target variable in "data"
+  # See ?makeClassiTask for more details 
+task=makeClassifTask(data=data.aux,target="condition")
+```
+
+### Logit model
+
+```{r mlr_logit,echo=TRUE,eval=FALSE}
+# Set the same inner and outer samples for different supervised learners within the same question
+  # Set seed at 2428
+  # inner sample (to tune parameters): subsampling with 500 iterations and 75%-25% for training-validating sets
+  # outer sample (to evaluate the model's performance): 10-fold cross-validation 
+set.seed(2428,"L'Ecuyer")
+inner=makeResampleDesc("Subsample",iters=500,split=3/4)
+set.seed(2428,"L'Ecuyer")
+outer=makeResampleDesc("CV",iters=10)
+
+# Defines the number of cores and the level of parallelization (when parallelization should be called)
+parallelStartSocket(core,level="mlr.resample")
+# Also needed to fix the same number of inner iterations 
+clusterSetRNGStream(iseed=2428)
+
+# Define the learner 
+  # cl: define the class of learner
+  # predict.type: predict in terms of probabilities, and not labels
+  # See ?makeLearner for more details 
+lrn.logit=makeLearner(cl="classif.logreg",predict.type="prob")
+
+# Define the set of parameters to be tuned
+  # method: to feature selection 
+  # alpha: parameter to be tuned. This is the minimum improvement to achieve in the backward/forward features selection method
+  # See ?makeFeatSelControlSequential for more detail on the type of "method"
+ctrl.logit=makeFeatSelControlSequential(method="sffs",maxit=NA,alpha=0.01)
+
+# Define the inner loop and performance measures to select the optimal set of parameters (accuracy, true negative rate and true positive rate)
+  # learner: the learner specified by makeLearner()
+  # control: control parameters specified by makeFeatSelControlSequential()
+  # resampling: use the inner samples to tune parameters
+  # measures: measure or list of measures to optimize in the inner loop
+  # See ?makeFeatSelWrapper for more details 
+lrn.logit2=makeFeatSelWrapper(learner=lrn.logit,
+                              control=ctrl.logit,
+                              resampling=inner,
+                              measures = list(acc,tnr,tpr),
+                              show.info=FALSE)
+
+# Define the outer loop and check the model's performance given the optimal set of parameters from the inner loop
+  # learner: the learner from the inner loop
+  # task: the tasl defined above
+  # resampling: use the outer samples to check the model's performance
+  # extract: information that we want to extract from the fitted model 
+  # measures: measure or list of measure to evaluate the model's performance
+r.logit=resample(learner=lrn.logit2,
+                 task=task,
+                 resampling=outer,
+                 extract=getFeatSelResult,
+                 show.info=FALSE,
+                 models=TRUE,
+                 measures=list(acc,tnr,tpr))
+# Stop parallelization 
+parallelStop()
+```
+
+### Classification tree
+
+```{r mlr_tree,echo=TRUE,eval=FALSE}
+# Set the same inner and outer samples for different supervised learners within the same question
+  # Set seed at 2428
+  # inner sample (to tune parameters): subsampling with 500 iterations and 75%-25% for training-validating sets
+  # outer sample (to evaluate the model's performance): 10-fold cross-validation 
+set.seed(2428,"L'Ecuyer")
+inner=makeResampleDesc("Subsample",iters=500,split=3/4)
+set.seed(2428,"L'Ecuyer")
+outer=makeResampleDesc("CV",iters=10)
+
+# Defines the number of cores and the level of parallelization (when parallelization should be called)
+parallelStartSocket(core,level="mlr.resample")
+# Also needed to fix the same number of inner iterations 
+clusterSetRNGStream(iseed=2428)
+
+# Define the learner 
+  # cl: define the class of learner
+  # predict.type: predict in terms of probabilities, and not labels
+  # See ?makeLearner for more details 
+lrn.rpart=makeLearner(cl="classif.rpart",predict.type="prob")
+
+# Define the parameters to be tuned in the inner loop
+  # "cp": the complexity number 
+  # the range of values used for tunning the complexity number
+ps.rpart=makeParamSet(makeDiscreteParam("cp",values=seq(0,1,0.01)))
+ctrl.rpart=makeTuneControlGrid()
+
+# Define the inner loop and performance measures to select the optimal set of parameters (accuracy, true negative rate and true positive rate)
+  # learner: the learner specified by makeLearner()
+  # control: control parameters specified by makeFeatSelControlSequential()
+  # resampling: use the inner samples to tune parameters
+  # measures: measure or list of measures to optimize in the inner loop
+  # See ?makeFeatSelWrapper for more details 
+lrn.rpart2=makeTuneWrapper(lrn.rpart,
+                           resampling=inner,
+                           par.set=ps.rpart,
+                           control=ctrl.rpart,
+                           measures=list(acc,tnr,tpr),
+                           show.info=FALSE)
+# Define the outer loop and check the model's performance given the optimal set of parameters from the inner loop
+  # learner: the learner from the inner loop
+  # task: the tasl defined above
+  # resampling: use the outer samples to check the model's performance
+  # extract: information that we want to extract from the fitted model 
+  # measures: measure or list of measure to evaluate the model's performance
+r.rpart=resample(lrn.rpart2,
+                 task,
+                 resampling=outer,
+                 extract=getTuneResult,
+                 measures=list(acc,tnr,tpr),
+                 show.info=FALSE)
+# Stop parallelization 
+parallelStop()
+```
+
+### Random Forest
+
+```{r mlr_random_forest,echo=TRUE,eval=FALSE}
+# Set the same inner and outer samples for different supervised learners within the same question
+  # Set seed at 2428
+  # inner sample (to tune parameters): subsampling with 500 iterations and 75%-25% for training-validating sets
+  # outer sample (to evaluate the model's performance): 10-fold cross-validation 
+set.seed(2428,"L'Ecuyer")
+inner=makeResampleDesc("Subsample",iters=500,split=3/4)
+set.seed(2428,"L'Ecuyer")
+outer=makeResampleDesc("CV",iters=10)
+
+# Defines the number of cores and the level of parallelization (when parallelization should be called)
+parallelStartSocket(core,level="mlr.resample")
+# Also needed to fix the same number of inner iterations 
+clusterSetRNGStream(iseed=2428)
+
+# Define the learner 
+  # cl: define the class of learner
+  # predict.type: predict in terms of probabilities, and not labels
+  # See ?makeLearner for more details 
+lrn.rf=makeLearner(cl="classif.randomForest",predict.type="prob")
+
+# Define the parameters to be tuned in the inner loop
+  # "ntree": number of trees
+  # "mtry": number of variables to be selected in each tree
+ps.rf=makeParamSet(makeDiscreteParam("ntree",values=seq(300,4200,by=300)),
+                   makeDiscreteParam("mtry" ,values=c(1,3,5,7,9,11)))
+ctrl.rf=makeTuneControlGrid()
+
+# Define the inner loop and performance measures to select the optimal set of parameters (accuracy, true negative rate and true positive rate)
+  # learner: the learner specified by makeLearner()
+  # control: control parameters specified by makeFeatSelControlSequential()
+  # resampling: use the inner samples to tune parameters
+  # measures: measure or list of measures to optimize in the inner loop
+  # See ?makeFeatSelWrapper for more details 
+lrn.rf2=makeTuneWrapper(lrn.rf,
+                        resampling=inner,
+                        par.set=ps.rf,
+                        control=ctrl.rf,
+                        measures=list(acc,tnr,tpr),
+                        show.info=FALSE)
+# Define the outer loop and check the model's performance given the optimal set of parameters from the inner loop
+  # learner: the learner from the inner loop
+  # task: the tasl defined above
+  # resampling: use the outer samples to check the model's performance
+  # extract: information that we want to extract from the fitted model 
+  # measures: measure or list of measure to evaluate the model's performance
+r.rf=resample(lrn.rf2,
+              task,
+              resampling=outer,
+              extract=getTuneResult,
+              measures=list(acc,tnr,tpr),
+              show.info=FALSE)
+# Stop parallelization 
+parallelStop()
+```
+
+### Gradient boosting
+
+```{r mlr_gbm,echo=TRUE,eval=FALSE}
+# Set the same inner and outer samples for different supervised learners within the same question
+  # Set seed at 2428
+  # inner sample (to tune parameters): subsampling with 500 iterations and 75%-25% for training-validating sets
+  # outer sample (to evaluate the model's performance): 10-fold cross-validation 
+set.seed(2428,"L'Ecuyer")
+inner=makeResampleDesc("Subsample",iters=500,split=3/4)
+set.seed(2428,"L'Ecuyer")
+outer=makeResampleDesc("CV",iters=10)
+
+# Defines the number of cores and the level of parallelization (when parallelization should be called)
+parallelStartSocket(core,level="mlr.resample")
+# Also needed to fix the same number of inner iterations 
+clusterSetRNGStream(iseed=2428)
+
+# Define the learner 
+  # cl: define the class of learner
+  # predict.type: predict in terms of probabilities, and not labels
+  # See ?makeLearner for more details 
+lrn.gbm=makeLearner(cl="classif.gbm",distribution="bernoulli",predict.type="prob")
+
+# Define the parameters to be tuned in the inner loop
+  # "n.trees": number of trees
+  # "interaction.depth": parameter that models the complexity of each tree 
+  # "shrinkage": to control how the boosting model learns 
+ps.gbm=makeParamSet(makeDiscreteParam("n.trees",values=seq(300,4200,by=300)),
+                    makeDiscreteParam("interaction.depth",values=c(1,3,5,7,9,11)),
+                    makeDiscreteParam("shrinkage",values=c(0.001,0.01,0.1)))
+ctrl.gbm=makeTuneControlGrid()
+
+# Define the inner loop and performance measures to select the optimal set of parameters (accuracy, true negative rate and true positive rate)
+  # learner: the learner specified by makeLearner()
+  # control: control parameters specified by makeFeatSelControlSequential()
+  # resampling: use the inner samples to tune parameters
+  # measures: measure or list of measures to optimize in the inner loop
+  # See ?makeFeatSelWrapper for more details 
+lrn.gbm2=makeTuneWrapper(lrn.gbm,
+                         resampling=inner,
+                         par.set=ps.gbm,
+                         control=ctrl.gbm,
+                         measures=list(acc,tnr,tpr),
+                         show.info=FALSE)
+# Define the outer loop and check the model's performance given the optimal set of parameters from the inner loop
+  # learner: the learner from the inner loop
+  # task: the tasl defined above
+  # resampling: use the outer samples to check the model's performance
+  # extract: information that we want to extract from the fitted model 
+  # measures: measure or list of measure to evaluate the model's performance
+r.gbm=resample(lrn.gbm2,
+               task,
+               resampling=outer,
+               extract=getTuneResult,
+               measures=list(acc,tnr,tpr),
+               show.info=FALSE)
+# Stop parallelization 
+parallelStop()
+```
+
+### Support Vector Machines
+
+```{r mlr_svm,echo=TRUE,eval=FALSE}
+# Set the same inner and outer samples for different supervised learners within the same question
+  # Set seed at 2428
+  # inner sample (to tune parameters): subsampling with 500 iterations and 75%-25% for training-validating sets
+  # outer sample (to evaluate the model's performance): 10-fold cross-validation 
+set.seed(2428,"L'Ecuyer")
+inner=makeResampleDesc("Subsample",iters=500,split=3/4)
+set.seed(2428,"L'Ecuyer")
+outer=makeResampleDesc("CV",iters=10)
+
+# Defines the number of cores and the level of parallelization (when parallelization should be called)
+parallelStartSocket(core,level="mlr.resample")
+# Also needed to fix the same number of inner iterations 
+clusterSetRNGStream(iseed=2428)
+
+# Define the learner 
+  # cl: define the class of learner
+  # predict.type: predict in terms of probabilities, and not labels
+  # See ?makeLearner for more details 
+lrn.svm=makeLearner(cl="classif.ksvm",predict.type="prob")
+
+# Define the parameters to be tuned in the inner loop
+  # "C": regularization parameter
+  # "sigma": parameter of the Normal kernel 
+ps.svm=makeParamSet(makeDiscreteParam("C",values=2^(-10:10)),
+		                makeDiscreteParam("sigma",values=2^(-10:10)))
+ctrl.svm=makeTuneControlGrid()
+
+# Define the inner loop and performance measures to select the optimal set of parameters (accuracy, true negative rate and true positive rate)
+  # learner: the learner specified by makeLearner()
+  # control: control parameters specified by makeFeatSelControlSequential()
+  # resampling: use the inner samples to tune parameters
+  # measures: measure or list of measures to optimize in the inner loop
+  # See ?makeFeatSelWrapper for more details 
+lrn.svm2=makeTuneWrapper(lrn.svm,
+                         resampling=inner,
+                         par.set=ps.svm,
+                         control=ctrl.svm,
+                         measures=list(acc,tnr,tpr),
+                         show.info=FALSE)
+# Define the outer loop and check the model's performance given the optimal set of parameters from the inner loop
+  # learner: the learner from the inner loop
+  # task: the tasl defined above
+  # resampling: use the outer samples to check the model's performance
+  # extract: information that we want to extract from the fitted model 
+  # measures: measure or list of measure to evaluate the model's performance
+r.svm=resample(lrn.svm2,
+               task,
+               resampling=outer,
+               extract=getTuneResult,
+               measures = list(acc, tnr, tpr),
+               show.info=FALSE)
+# Stop parallelization 
+parallelStop()
+```
+
+### Single hidden layer back-propagation networks
+
+```{r mlr_nn,echo=TRUE,eval=FALSE}
+# Set the same inner and outer samples for different supervised learners within the same question
+  # Set seed at 2428
+  # inner sample (to tune parameters): subsampling with 500 iterations and 75%-25% for training-validating sets
+  # outer sample (to evaluate the model's performance): 10-fold cross-validation 
+set.seed(2428,"L'Ecuyer")
+inner=makeResampleDesc("Subsample",iters=500,split=3/4)
+set.seed(2428,"L'Ecuyer")
+outer=makeResampleDesc("CV",iters=10)
+
+# Defines the number of cores and the level of parallelization (when parallelization should be called)
+parallelStartSocket(core,level="mlr.resample")
+# Also needed to fix the same number of inner iterations 
+clusterSetRNGStream(iseed=2428)
+
+# Define the learner 
+  # cl: define the class of learner
+  # predict.type: predict in terms of probabilities, and not labels
+  # See ?makeLearner for more details 
+lrn.net=makeLearner(cl="classif.nnet",predict.type="prob",skip=TRUE)
+
+# Define the parameters to be tuned in the inner loop
+  # "size": number of nodes in the hidden layer
+  # "maxit": maximum number of iterations  
+  # "decay": regularization parameter
+ps.net=makeParamSet(makeDiscreteParam("size",values=1:20),
+		                makeDiscreteParam("maxit",values=seq(100,1000,100)),
+		                makeDiscreteParam("decay", values= c(1e-4,1e-3,1e-2)))
+ctrl.net=makeTuneControlGrid()
+
+# Define the inner loop and performance measures to select the optimal set of parameters (accuracy, true negative rate and true positive rate)
+  # learner: the learner specified by makeLearner()
+  # control: control parameters specified by makeFeatSelControlSequential()
+  # resampling: use the inner samples to tune parameters
+  # measures: measure or list of measures to optimize in the inner loop
+  # See ?makeFeatSelWrapper for more details 
+lrn.net2=makeTuneWrapper(lrn.net,
+                         resampling=inner,
+                         par.set=ps.net,
+                         control=ctrl.net,
+                         show.info=FALSE)
+# Define the outer loop and check the model's performance given the optimal set of parameters from the inner loop
+  # learner: the learner from the inner loop
+  # task: the tasl defined above
+  # resampling: use the outer samples to check the model's performance
+  # extract: information that we want to extract from the fitted model 
+  # measures: measure or list of measure to evaluate the model's performance
+r.net=resample(lrn.net2,
+               task,
+               resampling=outer,
+               extract=getTuneResult,
+               show.info=FALSE,
+               measures=list(acc,tnr,tpr))
+# Stop parallelization 
+parallelStop()
+```
+
+
+
