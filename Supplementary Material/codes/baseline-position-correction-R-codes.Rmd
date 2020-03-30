@@ -1,0 +1,129 @@
+---
+title: "Predicting respondent difficulty in web surveys: A machine-learning approach based on mouse movement features"
+output: html_document
+---
+
+#### R codes method of correction "baseline and position"
+#### Authors: Amanda Fernández-Fontelo, Pascal J. Kieslich, Felix Henninger, Frauke Kreuter, Sonja Greven
+
+
+```{r libraries,echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+library(dplyr)
+library(mousetrap)
+library(ggplot2)
+library(tidyr)
+```
+
+```{r data, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+data=read.csv("...",header=TRUE,sep=";")
+```
+
+#### Position residuals
+
+The code below fits the equation: 
+$$Y_{ijk}=\gamma_{jk0}+\sum_{m=1}^{m_{k-1}}\gamma_{jkm}P_{ik}(m)+w_{ijk},$$
+which corresponds to equation (3) in the manuscript.
+
+```{r position, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+# Number of baseline questions: 8
+# Number of target questions  : 3
+questions=unique(data$question)
+questions=questions[questions!="employment_status"]
+questions=questions[questions!="employment_changes_slider"]
+mt_indices =  c(paste("xpos_flips_",c(0,4,10,20,50,100,200),sep=""),
+                paste("ypos_flips_",c(0,4,10,20,50,100,200),sep=""),
+                paste("hovers_",c(250,500,1000,2000,3000),sep=""),
+                paste("hover_time_",c(250,500,1000,2000,3000),sep=""),
+                "RT",
+                "initiation_time",
+                "idle_time",
+                "total_dist",
+                "vel_max",
+                "vel_max_time",
+                "acc_max",
+                "acc_max_time",
+                "acc_min",
+                "acc_min_time")
+data_residuals=data.frame()
+for (question in questions){
+        current_data=data %>% filter(question==!!question)
+        for (var in mt_indices){
+                current_lm=lm(as.formula(paste(var,"position",sep="~")),data=current_data)
+                current_data=cbind(current_data,resid(current_lm))
+                colnames(current_data)[ncol(current_data)]=paste(var,c("resid"),sep="_")}
+        data_residuals=bind_rows(data_residuals,current_data)}
+pos_corr_indices=data_residuals
+```
+
+#### Specify questions
+
+```{r questions, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+questions=unique(pos_corr_indices$question)
+questions=questions[!questions%in%c("employee_level","demography_edu")]
+# target question
+questions_crit="employment_detail"
+# baseline questions
+questions_pred=questions[questions!=questions_crit]
+```
+
+#### Remove participants with missing data 
+
+```{r missing, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+# Selecting just individuals with responses in the 8 baseline variables + 3 target variables
+id_obs=pos_corr_indices %>% 
+       select(id,question,RT) %>% 
+       filter(question %in% !!questions) %>% 
+       mutate(RT=1) %>%
+       spread(key="question",value="RT") %>% 
+       filter(!is.na(questions_crit))
+id_obs$n_data=rowSums(id_obs[,-1],na.rm=TRUE)
+id_obs=filter(id_obs,n_data==9)
+pos_corr_indices=filter(pos_corr_indices,id %in% id_obs$id)
+
+# Computing the average within the same individual in the same index across the eight baseline questions
+pos_corr_indices_crit=pos_corr_indices[!pos_corr_indices[,"question"]%in% 
+                      c("employment_detail","demography_edu","employee_level"),]
+idunique=unique(pos_corr_indices[,"id"])
+results_pos_average=data.frame(id=idunique[1],
+t(apply(pos_corr_indices_crit[pos_corr_indices_crit[,"id"]==idunique[1],49:82],2,mean)))
+for(j in 2:length(idunique)){
+        results_pos_average=rbind(results_pos_average,data.frame(id=idunique[j],
+        t(apply(pos_corr_indices_crit[pos_corr_indices_crit[,"id"]==idunique[j],49:82],2,mean))))}
+results=pos_corr_indices[pos_corr_indices[,"question"]=="employment_detail",c(1,49:82)]
+names(results)[2:ncol(results)]=paste(names(results)[2:ncol(results)],"_empdetail",sep="")
+results_pos_average=merge(results_pos_average,results,by="id")
+```
+
+#### Baseline residuals
+
+The code below fits the equation: 
+$$\widehat{w}_{ijk}=\phi_{j0}+\phi_{j1}\bar{\widehat{\omega}_{ij}}+v_{ijk},$$
+which corresponds to equation (4) in the manuscript.
+
+```{r final, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+mt_indices =  c(paste("xpos_flips_",c(0,4,10,20,50,100,200),sep=""),
+                paste("ypos_flips_",c(0,4,10,20,50,100,200),sep=""),
+                paste("hovers_",c(250,500,1000,2000,3000),sep=""),
+                paste("hover_time_",c(250,500,1000,2000,3000),sep=""),
+                "RT",
+                "initiation_time",
+                "idle_time",
+                "total_dist",
+                "vel_max",
+                "vel_max_time",
+                "acc_max",
+                "acc_max_time",
+                "acc_min",
+                "acc_min_time")
+
+corrected_indices=data.frame(x=residuals(lm(xpos_flips_0_resid_edulevel~xpos_flips_0_resid,
+                                            data=results_pos_average)))
+for(i in 2:length(mt_indices)){
+        corrected_indices=cbind(corrected_indices,
+        x=residuals(lm(results_pos_average[,i+35]~results_pos_average[,i+1])))}
+corrected_indices=cbind(id=results_pos_average[,"id"],corrected_indices)
+names(corrected_indices)[2:ncol(corrected_indices)]=paste(mt_indices,"_corrected",sep="")
+data_residuals_baseline=merge(pos_corr_indices[pos_corr_indices[,"question"]=="employment_detail",1:48],
+                              corrected_indices,by="id")
+```
+
