@@ -1,0 +1,96 @@
+---
+title: "Predicting respondent difficulty in web surveys: A machine-learning approach based on mouse movement features"
+output: html_document
+---
+
+#### R codes method of correction "baseline"
+#### Authors: Amanda Fernández-Fontelo, Pascal J. Kieslich, Felix Henninger, Frauke Kreuter, Sonja Greven
+
+
+```{r libraries,echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+library(dplyr)
+library(mousetrap)
+library(ggplot2)
+library(tidyr)
+```
+
+```{r data, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+data=read.csv("...",header=TRUE,sep=";")
+```
+
+## Specify questions
+
+```{r questions, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+questions=unique(results$question)
+questions=questions[!questions%in%c("employee_level","employment_status","demography_edu")]
+(questions_crit="employment_detail")
+(questions_pred=questions[questions!=questions_crit])
+```
+
+
+## Remove participants with missing data
+
+```{r missing, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+id_obs=results %>%
+  select(id,question,RT) %>%
+  filter(question %in% !!questions) %>%
+  mutate(RT=1) %>%
+  spread(key="question",value="RT") %>%
+  filter(!is.na(employment_detail))
+
+# exclude participants with incomplete data
+id_obs$n_data=rowSums(id_obs[,-1],na.rm = TRUE)
+table(id_obs$n_data)
+id_obs=filter(id_obs,n_data == 9)
+
+results_complete_data=filter(results,id %in% id_obs$id )
+```
+
+# Residuals analysis
+
+The code below fits the equation: 
+$$Y_{ijk}=\alpha_{j0}+\sum_{r=1}^{8}\alpha_{jr}B_{ijr}+\epsilon_{ijk},$$
+which corresponds to equation (2) in the manuscript.
+
+
+```{r final, echo=TRUE,eval=FALSE,warning=FALSE,message=FALSE}
+mt_indices =  c(paste("xpos_flips_",c(0,4,10,20,50,100,200),sep=""),
+                paste("ypos_flips_",c(0,4,10,20,50,100,200),sep=""),
+                paste("hovers_",c(250,500,1000,2000,3000),sep=""),
+                paste("hover_time_",c(250,500,1000,2000,3000),sep=""),
+                "RT",
+                "initiation_time",
+                "idle_time",
+                "total_dist",
+                "vel_max",
+                "vel_max_time",
+                "acc_max",
+                "acc_max_time",
+                "acc_min",
+                "acc_min_time")
+
+results_employment_detail_ind=filter(results_complete_data, question==!!questions_crit)
+
+for (var in mt_indices){
+  current_data <- results_complete_data %>%
+    select(id,question,!!var) %>%
+    filter(question %in% !!questions) %>%
+    spread(key="question",value=var) %>%
+    filter(!is.na(employment_detail))
+  current_lm=lm(as.formula(paste(questions_crit,paste(questions_pred,collapse = "+"),sep="~")),
+                   data=current_data)
+  current_results=data.frame(
+    id=current_data$id,
+    resid=resid(current_lm),
+    rsq=summary(current_lm)$r.squared)
+  colnames(current_results)[-1]=paste(var,colnames(current_results)[-1],sep="_")
+  results_employment_detail_ind <- merge(
+    results_employment_detail_ind,
+    current_results,
+    by="id")}
+
+
+results_employment_detail_ind_rsq=unique(as.data.frame(select(results_employment_detail_ind,c(question,ends_with("rsq")))))
+round(results_employment_detail_ind_rsq[,-1],2)
+```
+
