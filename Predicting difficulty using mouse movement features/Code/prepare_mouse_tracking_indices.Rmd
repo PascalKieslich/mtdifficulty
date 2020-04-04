@@ -1,0 +1,137 @@
+---
+title: "Predicting respondent difficulty in web surveys: A machine-learning approach based on mouse movement features"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#### R code for computing mouse-tracking indices
+
+#### Authors: Amanda Fernández-Fontelo, Pascal J. Kieslich, Felix Henninger, Frauke Kreuter, Sonja Greven
+
+
+```{r eval=FALSE}
+library(dplyr)
+library(mousetrap)
+library(ggplot2)
+```
+
+```{r eval=FALSE}
+data_id <- read.csv("...",sep=";",stringsAsFactors = FALSE)
+data_long <- read.csv("...",sep=";",stringsAsFactors = FALSE)
+mt_data_raw <- read.csv("...", stringsAsFactors=FALSE)
+```
+
+####  Filter participants
+
+```{r eval=FALSE}
+## Exclude non-unique participants
+table(data_id$last_participation)
+data_id <- subset(data_id,last_participation==TRUE)
+
+## Only keep completed surveys
+table(data_id$completed)
+data_id <- subset(data_id,completed==TRUE)
+
+## Only keep participants using the mouse
+table(data_id$input_device_f)
+data_id <- subset(data_id,input_device_f=="mouse")
+
+## Exclude participants with NA for age or gender
+table(is.na(data_id$demography_sex_f),is.na(data_id$demography_age))
+data_id <- subset(data_id,is.na(demography_sex_f)==FALSE & is.na(demography_age)==FALSE)
+
+## Exclude participants who selected gender=other (too few observations to model)
+table(data_id$demography_sex_f)
+data_id <- subset(data_id,demography_sex_f != "other")
+
+## Filter other dataset accordingly
+data_long <- subset(data_long, id%in%data_id$id)
+
+## Select relevant mouse-tracking data columns
+mt_data_raw <- subset(mt_data_raw, select=c(
+  url, # column for linking to questionnaire data
+  reload_probable, # column indicating if page might have been reloaded
+  timestamps, xpos, ypos # mouse-tracking data
+))
+
+
+```
+
+#### Filter trials
+
+```{r eval=FALSE}
+## Only keep trials where answer was given
+table(data_long$question,data_long$selection,useNA="always")
+table(data_long$question,is.na(data_long$selection))
+data_long <- subset(data_long,is.na(selection)==FALSE)
+
+## Check if mouse-tracking data is available for all trials
+table(data_long$question,data_long$i %in% mt_data_raw$url)
+
+## Merge and only keep trials with available mt data
+dataset <- merge(data_long,mt_data_raw,by.x="i",by.y = "url",all.x=FALSE,all.y=FALSE)
+
+## Exclude mt data with suspected reloads
+table(dataset$question,dataset$reload_probable)
+dataset <- subset(dataset,reload_probable!="True")
+
+## For education, remove cases where option with open text input was selected (9 or 10)
+table(dataset$question,dataset$selection)
+table(dataset$question,dataset$selection %in% c(9,10))
+dataset <- subset(dataset,!(question=="demography_edu" & selection %in% c(9,10)))
+
+
+## Exclude long trials (> 7 min)
+rt_long <- c(...)
+table(dataset$question,dataset$i %in%rt_long)
+dataset <- subset(dataset,(i %in% rt_long)==FALSE)
+```
+
+#### Calculate mouse-tracking indices
+
+```{r eval=FALSE}
+# Import into mousetrap
+mt_data <- mt_import_mousetrap(dataset,mt_id_label = "i", reset_timestamps = FALSE)
+
+# Resample to constant sampling rate
+mt_data <- mt_resample(mt_data, exact_last_timestamp = FALSE, 
+  save_as = "rs_trajectories",
+  step_size = 10, constant_interpolation = 8) 
+
+# Calculate MT measures
+mt_data <- mt_derivatives(mt_data,use="rs_trajectories")
+mt_data <- mt_measures(
+  mt_data, use="rs_trajectories", 
+  flip_threshold = c(0,4,10,20,50,100,200),
+  hover_threshold = c(250,500,1000,2000,3000),
+  hover_incl_initial = FALSE
+  )
+
+# Create results data.frame
+results <- merge(mt_data$data,mt_data$measures,by="mt_id")
+
+# Select relevant indices
+results <- select(
+  results,
+  id,i,question:condition,
+  xpos_flips_0:ypos_flips_200,
+  RT:idle_time,
+  hover_time_250:hovers_3000,
+  total_dist:vel_max_time,
+  acc_max:acc_min_time
+  )
+
+# Include demographics
+results <- merge(
+  results,
+  select(data_id,id,demography_sex_f:demography_edu_f_reduced),
+  by="id",
+  all.x = TRUE,
+  all.y = FALSE
+)
+
+# Export indices
+write.table(results,"...",sep=";",dec=".",row.names=FALSE)
+```
+
